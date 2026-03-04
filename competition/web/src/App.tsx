@@ -41,7 +41,6 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [moveDelay, setMoveDelay] = useState(500);
   const [timeLimitMs, setTimeLimitMs] = useState(10000);
-  const [tournamentTimeLimitMs, setTournamentTimeLimitMs] = useState(10000);
   const [tournament, setTournament] = useState<TournamentState | null>(null);
   const [tournamentRunning, setTournamentRunning] = useState(false);
   const engineRef = useRef<GameEngine | null>(null);
@@ -134,10 +133,53 @@ function App() {
     return 'draw-50-move';
   };
 
+  /** Play a single game and return the raw result. */
+  const playSingleGame = async (
+    white: BotInfo,
+    black: BotInfo,
+  ): Promise<{
+    winnerColor: 'w' | 'b' | null;
+    reason: GameWinReason;
+    isDraw: boolean;
+    totals: { white: number; black: number };
+  }> => {
+    if (!engineRef.current) throw new Error('Game engine not ready');
+
+    setWhitePlayer({ type: 'bot', bot: white });
+    setBlackPlayer({ type: 'bot', bot: black });
+    await engineRef.current.loadPlayers(
+      { type: 'bot', bot: white },
+      { type: 'bot', bot: black },
+    );
+    await engineRef.current.play();
+
+    const state = engineRef.current.getState();
+    if (state.status !== 'finished') throw new Error('Match aborted');
+
+    const totals = getMoveTimeTotals(state.moves);
+    const winnerColor = getWinnerColor(state.result);
+    const reason = getGameWinReason(state.result);
+    const isDraw =
+      !!state.result &&
+      (state.result.type === 'stalemate' ||
+        state.result.type === 'draw-repetition' ||
+        state.result.type === 'draw-insufficient' ||
+        state.result.type === 'draw-50-move');
+
+    return { winnerColor, reason, isDraw, totals };
+  };
+
+  /**
+   * Play a match between two bots.
+   *
+   * 1. Game 1: whiteBot plays white, blackBot plays black.
+   * 2. If the game is a draw, play a rematch with swapped colours.
+   * 3. If the rematch is also a draw, the winner is the bot that spent
+   *    less total thinking time across both games.
+   */
   const playBotMatch = async (
     whiteBot: BotInfo,
     blackBot: BotInfo,
-    tournamentTimeLimitMs: number = timeLimitMs,
   ): Promise<{
     winner: BotInfo;
     loser: BotInfo;
@@ -149,63 +191,51 @@ function App() {
     }
 
     const originalTimeLimit = engineRef.current.getTimeLimit();
-    engineRef.current.setTimeLimit(tournamentTimeLimitMs);
+    engineRef.current.setTimeLimit(timeLimitMs);
 
     const matchTotalTimeMs: Record<string, number> = { [whiteBot.username]: 0, [blackBot.username]: 0 };
+    const gameResults: MatchResult[] = [];
 
     try {
-      setWhitePlayer({ type: 'bot', bot: whiteBot });
-      setBlackPlayer({ type: 'bot', bot: blackBot });
-      await engineRef.current.loadPlayers(
-        { type: 'bot', bot: whiteBot },
-        { type: 'bot', bot: blackBot },
-      );
-      await engineRef.current.play();
+      // ── Game 1 ──────────────────────────────────────────────
+      const g1 = await playSingleGame(whiteBot, blackBot);
+      matchTotalTimeMs[whiteBot.username] += g1.totals.white;
+      matchTotalTimeMs[blackBot.username] += g1.totals.black;
 
-      const state = engineRef.current.getState();
-      if (state.status !== 'finished') {
-        throw new Error('Match aborted');
-      }
-
-      const totals = getMoveTimeTotals(state.moves);
-      matchTotalTimeMs[whiteBot.username] += totals.white;
-      matchTotalTimeMs[blackBot.username] += totals.black;
-
-      const winnerColor = getWinnerColor(state.result);
-      const reason = getGameWinReason(state.result);
-      const isDraw =
-        !!state.result &&
-        (state.result.type === 'stalemate' ||
-          state.result.type === 'draw-repetition' ||
-          state.result.type === 'draw-insufficient' ||
-          state.result.type === 'draw-50-move');
-
-      if (isDraw) {
-        const totalsDraw = getMoveTimeTotals(state.moves);
-        const winner = totalsDraw.white <= totalsDraw.black ? whiteBot : blackBot;
+      if (!g1.isDraw) {
+        const winner = g1.winnerColor === 'w' ? whiteBot : blackBot;
         const loser = winner === whiteBot ? blackBot : whiteBot;
-        return {
-          winner,
-          loser,
-          gameResults: [{ winner, loser, reason: 'time-advantage' }],
-          matchTotalTimeMs,
-        };
+        gameResults.push({ winner, loser, reason: g1.reason });
+        return { winner, loser, gameResults, matchTotalTimeMs };
       }
 
-      if (winnerColor === 'w') {
-        return {
-          winner: whiteBot,
-          loser: blackBot,
-          gameResults: [{ winner: whiteBot, loser: blackBot, reason }],
-          matchTotalTimeMs,
-        };
+      // Game 1 was a draw — record it and play a rematch with swapped colours
+      gameResults.push({ winner: whiteBot, loser: blackBot, reason: 'draw' });
+
+      // ── Game 2 (rematch, colours swapped) ───────────────────
+      const g2 = await playSingleGame(blackBot, whiteBot);
+      // blackBot played white in g2, whiteBot played black
+      matchTotalTimeMs[blackBot.username] += g2.totals.white;
+      matchTotalTimeMs[whiteBot.username] += g2.totals.black;
+
+      if (!g2.isDraw) {
+        // g2.winnerColor is relative to g2 where blackBot=white, whiteBot=black
+        const winner = g2.winnerColor === 'w' ? blackBot : whiteBot;
+        const loser = winner === whiteBot ? blackBot : whiteBot;
+        gameResults.push({ winner, loser, reason: g2.reason });
+        return { winner, loser, gameResults, matchTotalTimeMs };
       }
-      return {
-        winner: blackBot,
-        loser: whiteBot,
-        gameResults: [{ winner: blackBot, loser: whiteBot, reason }],
-        matchTotalTimeMs,
-      };
+
+      // Both games drawn — tiebreak by total thinking time
+      gameResults.push({ winner: blackBot, loser: whiteBot, reason: 'draw' });
+
+      const winner =
+        matchTotalTimeMs[whiteBot.username] <= matchTotalTimeMs[blackBot.username]
+          ? whiteBot
+          : blackBot;
+      const loser = winner === whiteBot ? blackBot : whiteBot;
+      gameResults.push({ winner, loser, reason: 'time-advantage' });
+      return { winner, loser, gameResults, matchTotalTimeMs };
     } finally {
       engineRef.current.setTimeLimit(originalTimeLimit);
     }
@@ -238,7 +268,7 @@ function App() {
         thirdPlace: null,
         fourthPlace: null,
         headToHead: {},
-        tournamentTimeLimitMs: tournamentTimeLimitMs,
+        tournamentTimeLimitMs: timeLimitMs,
         matchLog: [],
       };
 
@@ -269,7 +299,7 @@ function App() {
         setTournament((prev) => (prev ? { ...prev, currentMatchBots: { white: whiteBot, black: blackBot } } : prev));
         await new Promise((r) => setTimeout(r, 0));
 
-        const result = await playBotMatch(whiteBot, blackBot, tournamentTimeLimitMs);
+        const result = await playBotMatch(whiteBot, blackBot);
         for (const gr of result.gameResults) {
           baseState.matchLog!.push({
             white: whiteBot.username,
@@ -514,20 +544,7 @@ function App() {
             />
             <span className="delay-value">{moveDelay}ms</span>
           </div>
-          <div className="tournament-controls">
-            <label htmlFor="tournament-time-limit">Bot Time Limit (ms):</label>
-            <input
-              id="tournament-time-limit"
-              type="range"
-              min="1000"
-              max="60000"
-              step="1000"
-              value={tournamentTimeLimitMs}
-              onChange={(e) => setTournamentTimeLimitMs(parseInt(e.target.value, 10))}
-              disabled={tournamentRunning}
-            />
-            <span className="delay-value">{tournamentTimeLimitMs}ms</span>
-          </div>
+
           <button
             className="btn-start"
             onClick={handleStartTournament}
